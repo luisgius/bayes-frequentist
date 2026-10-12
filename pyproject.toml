@@ -1,0 +1,46 @@
+[build-system]
+requires = ["hatchling>=1.32.4", "editables>=0.6"]
+build-backend = "hatchling.build"
+
+[project]
+name = "bayesfreq"
+version = "0.1.0"
+description = "Bayes risk and bounded frequentist coverage for an on/off counting experiment"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+authors = [{name = "Luis"}]
+dependencies = [
+    "numpy>=2.5.4",
+    "scipy>=1.18.1",
+    "pandas>=3.0.6",
+    "matplotlib>=3.11.2",
+    "seaborn>=0.13.2",
+    "torch>=2.14.1",
+    "tqdm>=4.70.1",
+]
+
+[project.urls]
+Repository = "https://github.com/luisgius/bayes-frequentist"
+
+[project.optional-dependencies]
+dev = ["pytest>=9.1.1", "ruff>=0.17.0"]
+notebook = ["jupyter>=1.1.1", "nbconvert>=7.17.1", "nbformat>=5.11.1", "ipykernel>=7.4.0"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/bayesfreq"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.format]
+exclude = ["*.ipynb", "*.md"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "NPY"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = '-m "not slow"'
+markers = ["slow: extended simulation, training, or reference checks"]
