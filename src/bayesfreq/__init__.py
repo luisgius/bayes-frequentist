@@ -6,6 +6,8 @@ config
     Frozen study constants (``FULL_CONFIG``, ``CORE_CONFIG``).
 data_simulator
     Priors, the shared simulator, and exact likelihoods.
+interfaces
+    Shared result records and structural protocols.
 """
 
 from bayesfreq.config import CORE_CONFIG, FULL_CONFIG, StudyConfig
