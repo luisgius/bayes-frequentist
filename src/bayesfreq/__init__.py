@@ -8,6 +8,8 @@ data_simulator
     Priors, the shared simulator, and exact likelihoods.
 interfaces
     Shared result records and structural protocols.
+bayesian_risk
+    Path A: posterior approximations, Bayes risk, frequentist risk, and SBC.
 """
 
 from bayesfreq.config import CORE_CONFIG, FULL_CONFIG, StudyConfig
