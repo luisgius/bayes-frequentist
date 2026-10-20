@@ -1,8 +1,8 @@
 """Path A: Bayesian inference for the signal mu and Monte Carlo risk diagnostics.
 
 This module holds the Path A estimators of mu on Theta = [0, mu_max]: the exact
-grid posterior, a Gamma plug-in posterior, a Laplace-type approximation and
-the clipped MLE. It also estimates Bayes risk,
+grid posterior, a Gamma plug-in posterior, a Laplace-type approximation, an
+amortized neural posterior and the clipped MLE. It also estimates Bayes risk,
 frequentist risk and simulation-based calibration (SBC) ranks, and times inference.
 Every public predictor takes raw float64 observations x of shape (N, 3) with
 columns (n_on, n_off, eps_hat). The exact posterior uses quadrature: a zero atom
@@ -10,17 +10,23 @@ plus midpoint cells for mu, Gauss-Legendre nodes for the background b, and
 Gauss-Hermite nodes for log eps given eps_hat.
 """
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from functools import lru_cache
+from pathlib import Path
 from time import perf_counter
 from typing import Literal
 
 import numpy as np
+import torch
 from numpy.typing import NDArray
 from scipy.special import gammainc, gammaincinv, gammaln, logsumexp, roots_hermitenorm, xlogy
+from torch import nn
 
 from bayesfreq.config import (
     FULL_CONFIG,
+    GridConfig,
+    MonteCarloConfig,
+    ProblemConfig,
     StudyConfig,
 )
 from bayesfreq.data_simulator import Prior, reality_prior, sample_joint, simulate
@@ -35,12 +41,14 @@ from bayesfreq.interfaces import (
 FloatArray = NDArray[np.float64]
 __all__ = [
     "GridPosterior",
+    "AmortizedPosterior",
     "GammaPluginPosterior",
     "LaplacePosterior",
     "exact_posterior",
     "gamma_plugin_moments",
     "laplace_moments",
     "clipped_mle",
+    "train_amortized",
     "estimate_bayes_risk",
     "estimate_frequentist_risk",
     "simulation_based_calibration",
@@ -719,6 +727,388 @@ def clipped_mle(x: FloatArray, *, config: StudyConfig = FULL_CONFIG) -> FloatArr
         else (values[:, 0] - values[:, 1] / p.tau) / values[:, 2]
     )
     return np.clip(estimate, 0, p.mu_max).astype(np.float64)
+
+
+def _network(n_bins: int) -> nn.Sequential:
+    """Return the MLP: 4 inputs, two hidden layers of 64 SiLU units, ``n_bins`` logits."""
+    return nn.Sequential(
+        nn.Linear(4, 64), nn.SiLU(), nn.Linear(64, 64), nn.SiLU(), nn.Linear(64, n_bins)
+    )
+
+
+def _features(x: FloatArray, config: StudyConfig) -> NDArray[np.float32]:
+    """Map raw observations to the four scaled float32 network inputs, shape (N, 4)."""
+    values = _observations(x)
+    p = config.problem
+    b = np.full(len(values), p.known_b) if p.mode == "core" else values[:, 1] / p.tau
+    return np.column_stack(
+        (
+            np.log1p(values[:, 0]) / 3,
+            np.log1p(b) / 3,
+            np.log(values[:, 2]) / max(p.sigma_eps, 0.1),
+            (values[:, 0] - b) / p.mu_max,
+        )
+    ).astype(np.float32)
+
+
+class AmortizedPosterior:
+    """Amortized neural posterior for mu: an MLP that outputs class probabilities.
+
+    The network maps four features of x to K + 1 logits. Class 0 is the zero
+    atom (mu = 0). Classes 1..K are the bins between consecutive ``edges``;
+    ``train_amortized`` uses K = 100 equal-width bins. The density inside a
+    bin is taken as uniform. Means, variances, quantiles and draws all use
+    this one approximate distribution. Instances come from ``train_amortized``
+    or ``load``. Path B calls only ``load`` and ``moments``, so it never
+    touches the network or the feature transform. Inference runs on CPU.
+
+    Notes
+    -----
+    With class probabilities w_j, centers c_j and bin widths h_j (c_0 = h_0 = 0
+    for the atom)::
+
+        E[mu | x] = sum_j w_j c_j
+        Var[mu | x] = sum_j w_j (c_j**2 + h_j**2 / 12) - E[mu | x]**2
+
+    ``h**2 / 12`` is the variance of a uniform law on a bin of width h. The
+    atom class gets probability zero (logit -inf) unless the prior is the
+    reality family with ``zero_mass > 0``.
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        edges: FloatArray,
+        prior: Prior,
+        config: StudyConfig,
+        training_seconds: float = 0.0,
+        seed: int = 0,
+    ) -> None:
+        """Wrap a network with the metadata needed to read its outputs.
+
+        Parameters
+        ----------
+        model : torch.nn.Module
+            Network from (N, 4) float32 features to (N, K + 1) logits. It is
+            moved to CPU and put in evaluation mode.
+        edges : ndarray, shape (K + 1,)
+            Increasing edges of the positive bins.
+        prior : Prior
+            Training prior; it decides whether the zero atom is used.
+        config : StudyConfig
+            Config used for the features and for training.
+        training_seconds : float, default 0.0
+            Recorded training wall time, in seconds.
+        seed : int, default 0
+            Recorded training seed.
+        """
+        self.model = model.cpu().eval()
+        self.edges = edges
+        self.config = config
+        self.prior = prior
+        self.training_seconds = training_seconds
+        self.seed = seed
+        self.centers = np.concatenate(([0.0], (edges[:-1] + edges[1:]) / 2))
+        self.within_variance = np.concatenate(([0.0], np.diff(edges) ** 2 / 12))
+
+    def _probabilities(self, x: FloatArray) -> FloatArray:
+        """Return float64 class probabilities (N, K + 1); index 0 is the zero atom."""
+        with torch.inference_mode():
+            logits = self.model(torch.from_numpy(_features(x, self.config)))
+            if self.prior.family != "reality" or self.prior.zero_mass == 0:
+                logits[:, 0] = -torch.inf
+            return torch.softmax(logits, dim=1).numpy().astype(np.float64)
+
+    def __call__(self, x: FloatArray) -> FloatArray:
+        """Return posterior means, so the model can act as a ``PointEstimator``.
+
+        Parameters
+        ----------
+        x : ndarray, shape (N, 3)
+            Raw observations (n_on, n_off, eps_hat).
+
+        Returns
+        -------
+        ndarray, shape (N,)
+            ``moments(x).mean`` as float64.
+        """
+        return self.moments(x).mean
+
+    def moments(self, x: FloatArray) -> PosteriorMoments:
+        """Return the mean and variance of the atom-plus-uniform-bin distribution.
+
+        Parameters
+        ----------
+        x : ndarray, shape (N, 3)
+            Raw observations (n_on, n_off, eps_hat).
+
+        Returns
+        -------
+        PosteriorMoments
+            Mean and variance, each float64 of shape (N,). The variance
+            includes the within-bin term h**2/12 and is clipped at zero.
+        """
+        weights = self._probabilities(x)
+        mean = weights @ self.centers
+        second = weights @ (self.centers**2 + self.within_variance)
+        return PosteriorMoments(mean, np.maximum(second - mean**2, 0))
+
+    def _quantile(self, weights: FloatArray, q: float) -> FloatArray:
+        """Return each row's q-quantile, interpolated linearly inside a uniform bin."""
+        cdf = np.cumsum(weights, axis=1)
+        cdf[:, -1] = 1.0
+        indices = np.argmax(cdf >= q, axis=1)
+        rows = np.arange(len(weights))
+        before = np.where(indices > 0, cdf[rows, np.maximum(indices - 1, 0)], 0)
+        cell = np.maximum(indices - 1, 0)
+        fraction = np.clip((q - before) / np.maximum(weights[rows, indices], 1e-300), 0, 1)
+        values = self.edges[cell] + fraction * (self.edges[cell + 1] - self.edges[cell])
+        return np.where(indices == 0, 0, values)
+
+    def intervals(self, x: FloatArray, *, alpha: float = 0.1) -> IntervalBatch:
+        """Return equal-tail credible intervals from the same approximate distribution.
+
+        Parameters
+        ----------
+        x : ndarray, shape (N, 3)
+            Raw observations (n_on, n_off, eps_hat).
+        alpha : float, default 0.1 (``FULL_CONFIG.problem.alpha``)
+            Total tail probability, strictly between 0 and 1.
+
+        Returns
+        -------
+        IntervalBatch
+            The alpha/2 and 1 - alpha/2 quantiles, each of shape (N,). A
+            quantile that falls in the atom is 0. Otherwise it is interpolated
+            linearly inside its bin.
+
+        Raises
+        ------
+        ValueError
+            If alpha is not strictly between 0 and 1.
+        """
+        _alpha(alpha)
+        weights = self._probabilities(x)
+        return IntervalBatch(
+            self._quantile(weights, alpha / 2), self._quantile(weights, 1 - alpha / 2)
+        )
+
+    def sample(self, x: FloatArray, n_draws: int, *, rng: np.random.Generator) -> FloatArray:
+        """Draw mu from the atom-plus-uniform-bin distribution.
+
+        Each draw picks a class with its predicted probability. Class 0 gives
+        mu = 0; a bin class gives a uniform value inside that bin.
+
+        Parameters
+        ----------
+        x : ndarray, shape (N, 3)
+            Raw observations (n_on, n_off, eps_hat).
+        n_draws : int
+            Number of draws per observation.
+        rng : numpy.random.Generator
+            Explicit random source.
+
+        Returns
+        -------
+        ndarray, shape (N, n_draws)
+            Draws of mu, with exact zeros for the atom.
+        """
+        indices = _draw_indices(self._probabilities(x), n_draws, rng)
+        cells = np.maximum(indices - 1, 0)
+        values = self.edges[cells] + rng.random(indices.shape) * np.diff(self.edges)[cells]
+        return np.where(indices == 0, 0, values)
+
+    def save(self, path: str | Path) -> Path:
+        """Save the CPU weights and the metadata needed to reproduce predictions.
+
+        Parameters
+        ----------
+        path : str or Path
+            Destination file. Missing parent directories are created.
+
+        Returns
+        -------
+        Path
+            The destination path.
+
+        Notes
+        -----
+        The file is a ``torch.save`` dict with ``format_version`` 1, the
+        network state dict, ``edges``, the config, the prior fields (without
+        its config), ``training_seconds`` and ``seed``.
+        """
+        destination = Path(path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {
+                "format_version": 1,
+                "state": self.model.state_dict(),
+                "edges": self.edges.tolist(),
+                "config": asdict(self.config),
+                "prior": {
+                    key: value for key, value in asdict(self.prior).items() if key != "config"
+                },
+                "training_seconds": self.training_seconds,
+                "seed": self.seed,
+            },
+            destination,
+        )
+        return destination
+
+    @classmethod
+    def load(cls, path: str | Path) -> "AmortizedPosterior":
+        """Load a model written by ``save``.
+
+        Parameters
+        ----------
+        path : str or Path
+            File written by ``save`` with ``format_version`` 1.
+
+        Returns
+        -------
+        AmortizedPosterior
+            The rebuilt CPU model with its config, prior and training metadata.
+
+        Raises
+        ------
+        FileNotFoundError
+            If the file does not exist (run Path A first to create it).
+        ValueError
+            If the file has a different ``format_version``.
+
+        Notes
+        -----
+        The file is read with ``weights_only=True``. The empty network is built
+        inside ``torch.random.fork_rng``, so loading leaves the global torch
+        random state unchanged.
+        """
+        source = Path(path)
+        if not source.exists():
+            raise FileNotFoundError(f"Run Path A first; missing amortized artifact: {source}")
+        data = torch.load(source, map_location="cpu", weights_only=True)
+        if data.get("format_version") != 1:
+            raise ValueError("incompatible amortized-posterior artifact")
+        config_data = data["config"]
+        grid_data = config_data["grid"]
+        # Grid fields must be tuples, not lists, so the config hashes and compares equal.
+        grid_data["mu_cov_grid"] = tuple(grid_data["mu_cov_grid"])
+        grid_data["b_cov_grid"] = tuple(grid_data["b_cov_grid"])
+        config = StudyConfig(
+            ProblemConfig(**config_data["problem"]),
+            GridConfig(**grid_data),
+            MonteCarloConfig(**config_data["mc"]),
+            config_data["seed"],
+        )
+        edges = np.asarray(data["edges"], dtype=np.float64)
+        with torch.random.fork_rng():
+            model = _network(len(edges))
+        model.load_state_dict(data["state"])
+        return cls(
+            model,
+            edges,
+            Prior(config=config, **data["prior"]),
+            config,
+            data["training_seconds"],
+            data["seed"],
+        )
+
+
+def train_amortized(
+    *,
+    prior: Prior | None = None,
+    config: StudyConfig = FULL_CONFIG,
+    n_train: int | None = None,
+    epochs: int = 100,
+    seed: int = 20261012,
+) -> AmortizedPosterior:
+    """Train the amortized neural posterior on simulated (theta, x) pairs.
+
+    Parameters
+    ----------
+    prior : Prior, optional
+        Prior that generates the training data; it must use ``config``.
+        Default: the reality prior.
+    config : StudyConfig, default FULL_CONFIG
+        Model constants and the default training size.
+    n_train : int, optional
+        Number of simulated pairs, at least 2. Default: ``config.mc.n_train``.
+    epochs : int, default 100
+        Number of passes over the training data, at least 1.
+    seed : int, default 20261012
+        Seed of the NumPy RNG (simulation and shuffling) and of torch
+        weight initialization.
+
+    Returns
+    -------
+    AmortizedPosterior
+        Trained model with the zero-atom class and K = 100 equal-width bins on
+        [mu_min, mu_max] (reality prior) or [0, mu_max] (other priors).
+
+    Raises
+    ------
+    ValueError
+        If n_train < 2, epochs < 1, or the prior uses another config.
+
+    Notes
+    -----
+    The label is class 0 for mu = 0 and otherwise the bin that contains mu.
+    The loss on each mini-batch of 1024 is the cross entropy of the labels
+    plus 2 times the mean squared error of the predicted mean ``sum_j w_j c_j``
+    (prediction and truth both divided by mu_max). Cross entropy fits the
+    class probabilities. The squared-error term targets the posterior mean,
+    which minimizes expected squared loss. Adam starts at learning rate 0.003
+    and drops to 0.001 after epoch ``int(0.7 * epochs)`` (0-based). Training
+    stops after a fixed number of epochs, not after a time limit, so a given
+    seed gives the same model. ``torch.manual_seed`` runs inside
+    ``torch.random.fork_rng``, so the global torch random state is restored.
+    The call sets ``torch.set_num_threads(1)`` during training and restores
+    the previous thread count even if training raises. ``training_seconds``
+    includes data simulation.
+    """
+    selected = _prior(prior, config)
+    count = config.mc.n_train if n_train is None else n_train
+    if count < 2 or epochs < 1:
+        raise ValueError("training requires n_train>=2 and epochs>=1")
+    started = perf_counter()
+    previous_threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        rng = np.random.default_rng(seed)
+        theta, x = sample_joint(count, rng=rng, config=config, prior=selected)
+        low = selected.mu_min if selected.family == "reality" else 0.0
+        edges = np.linspace(low, config.problem.mu_max, 101)
+        labels = np.clip(np.searchsorted(edges, theta[:, 0], side="right"), 1, len(edges) - 1)
+        labels[theta[:, 0] == 0] = 0
+        features = torch.from_numpy(_features(x, config))
+        targets = torch.from_numpy(labels.astype(np.int64))
+        signals = torch.from_numpy((theta[:, 0] / config.problem.mu_max).astype(np.float32))
+        centers = torch.tensor(
+            np.concatenate(([0.0], (edges[:-1] + edges[1:]) / 2)) / config.problem.mu_max,
+            dtype=torch.float32,
+        )
+        with torch.random.fork_rng():
+            torch.manual_seed(seed)
+            model = _network(len(edges))
+            optimizer = torch.optim.Adam(model.parameters(), lr=0.003)
+            for epoch in range(epochs):
+                order = rng.permutation(count)
+                for start in range(0, count, 1024):
+                    index = torch.from_numpy(order[start : start + 1024])
+                    logits = model(features[index])
+                    loss = nn.functional.cross_entropy(logits, targets[index])
+                    # Add a squared-error term on the predicted mean, on the mu / mu_max scale.
+                    prediction = torch.softmax(logits, dim=1) @ centers
+                    loss = loss + 2 * nn.functional.mse_loss(prediction, signals[index])
+                    optimizer.zero_grad(set_to_none=True)
+                    loss.backward()
+                    optimizer.step()
+                # One step decay of the learning rate after 70% of the epochs.
+                if epoch == int(epochs * 0.7):
+                    for group in optimizer.param_groups:
+                        group["lr"] = 0.001
+        return AmortizedPosterior(model, edges, selected, config, perf_counter() - started, seed)
+    finally:
+        torch.set_num_threads(previous_threads)
 
 
 def _loss_result(truth: FloatArray, estimate: FloatArray, loss: str) -> RiskResult:

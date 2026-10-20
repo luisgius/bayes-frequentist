@@ -8,6 +8,7 @@ from scipy.optimize import minimize
 from scipy.special import gammainc, logsumexp, roots_hermitenorm
 
 from bayesfreq.bayesian_risk import (
+    AmortizedPosterior,
     GammaPluginPosterior,
     clipped_mle,
     estimate_bayes_risk,
@@ -17,9 +18,15 @@ from bayesfreq.bayesian_risk import (
     laplace_moments,
     simulation_based_calibration,
     time_inference,
+    train_amortized,
 )
 from bayesfreq.config import CORE_CONFIG, FULL_CONFIG
 from bayesfreq.data_simulator import Prior, log_likelihood_full, reality_prior, sample_joint
+
+
+@pytest.fixture(scope="module")
+def neural():
+    return train_amortized(config=CORE_CONFIG, n_train=2500, epochs=15, seed=123)
 
 
 def test_gamma_prior_closed_form_without_background():
@@ -98,12 +105,13 @@ def test_full_nuisance_quadrature_against_direct_likelihood():
     np.testing.assert_allclose(posterior.weights[0], weights, atol=1e-10, rtol=1e-8)
 
 
-def test_reference_mean_has_smallest_squared_bayes_risk():
+def test_reference_mean_has_smallest_squared_bayes_risk(neural):
     count = 6000
     estimators = [
         lambda x: gamma_plugin_moments(x, config=CORE_CONFIG).mean,
         lambda x: laplace_moments(x, config=CORE_CONFIG).mean,
         lambda x: clipped_mle(x, config=CORE_CONFIG),
+        neural,
     ]
     exact = estimate_bayes_risk(
         lambda x: exact_posterior(x, config=CORE_CONFIG).mean,
@@ -138,12 +146,13 @@ def test_mle_agrees_with_direct_full_likelihood_optimization():
         assert abs(fit.x[0] - estimate) < 2e-5
 
 
-def test_estimator_bounds_and_batch_contract():
+def test_estimator_bounds_and_batch_contract(neural):
     _, x = sample_joint(25, rng=np.random.default_rng(88), config=CORE_CONFIG)
     candidates = [
         exact_posterior(x, config=CORE_CONFIG),
         gamma_plugin_moments(x, config=CORE_CONFIG),
         laplace_moments(x, config=CORE_CONFIG),
+        neural.moments(x),
     ]
     for posterior in candidates:
         assert posterior.mean.shape == posterior.variance.shape == (len(x),)
@@ -153,6 +162,29 @@ def test_estimator_bounds_and_batch_contract():
         assert np.all(posterior.variance >= 0)
     mle = clipped_mle(x, config=CORE_CONFIG)
     assert np.all((mle >= 0) & (mle <= 10))
+
+
+def test_seeded_neural_reproducible_and_saved(tmp_path, neural):
+    first = train_amortized(config=CORE_CONFIG, n_train=600, epochs=3, seed=91)
+    second = train_amortized(config=CORE_CONFIG, n_train=600, epochs=3, seed=91)
+    _, x = sample_joint(12, rng=np.random.default_rng(99), config=CORE_CONFIG)
+    np.testing.assert_array_equal(first(x), second(x))
+    restored = AmortizedPosterior.load(neural.save(tmp_path / "model.pt"))
+    np.testing.assert_array_equal(neural(x), restored(x))
+    np.testing.assert_array_equal(neural.moments(x).variance, restored.moments(x).variance)
+    assert restored.config == CORE_CONFIG
+
+
+def test_neural_draw_distribution_matches_moments(neural):
+    x = np.array([[0, 15, 1], [7, 15, 1]], dtype=float)
+    draws = neural.sample(x, 30000, rng=np.random.default_rng(4))
+    moments = neural.moments(x)
+    assert np.all((draws >= 0) & (draws <= 10))
+    assert np.any(draws == 0)
+    np.testing.assert_allclose(draws.mean(axis=1), moments.mean, atol=0.01, rtol=0.04)
+    np.testing.assert_allclose(draws.var(axis=1), moments.variance, atol=0.03, rtol=0.05)
+    intervals = neural.intervals(x)
+    assert np.all((intervals.lower >= 0) & (intervals.upper <= 10))
 
 
 def test_risk_mc_error_and_seeded_results():
@@ -227,10 +259,12 @@ def test_gamma_sampler_matches_truncated_moments():
     assert moments.mean[0] == pytest.approx(expected)
 
 
-def test_input_validation():
+def test_validation_and_missing_model(tmp_path):
     with pytest.raises(ValueError, match="shape"):
         exact_posterior(np.ones(3))
     with pytest.raises(ValueError, match="same config"):
         exact_posterior(np.array([[1, 15, 1.0]]), prior=reality_prior(CORE_CONFIG))
     with pytest.raises(ValueError, match="at least two"):
         estimate_bayes_risk(clipped_mle, rng=np.random.default_rng(2), n_samples=1)
+    with pytest.raises(FileNotFoundError, match="Run Path A first"):
+        AmortizedPosterior.load(tmp_path / "missing.pt")
