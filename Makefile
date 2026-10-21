@@ -2,7 +2,7 @@ PYTHON := .venv/bin/python
 UV := uv
 TORCH_INDEX := https://download.pytorch.org/whl/cpu
 
-.PHONY: setup test test-all lint
+.PHONY: setup test test-all lint path-a
 
 setup:
 	$(UV) venv --python 3.12 --allow-existing .venv
@@ -19,3 +19,6 @@ test-all:
 lint:
 	.venv/bin/ruff check .
 	.venv/bin/ruff format --check .
+
+path-a:
+	$(PYTHON) scripts/run_path_a.py

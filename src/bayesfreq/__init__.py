@@ -10,6 +10,8 @@ interfaces
     Shared result records and structural protocols.
 bayesian_risk
     Path A: posterior approximations, Bayes risk, frequentist risk, and SBC.
+plotting
+    Shared figure style.
 """
 
 from bayesfreq.config import CORE_CONFIG, FULL_CONFIG, StudyConfig
