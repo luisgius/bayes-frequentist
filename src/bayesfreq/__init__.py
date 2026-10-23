@@ -10,6 +10,8 @@ interfaces
     Shared result records and structural protocols.
 bayesian_risk
     Path A: posterior approximations, Bayes risk, frequentist risk, and SBC.
+frequentist_bounds
+    Path B: Feldman-Cousins belts, calibrated confidence sets, and coverage.
 plotting
     Shared figure style.
 """
