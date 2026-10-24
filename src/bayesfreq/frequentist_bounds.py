@@ -1,14 +1,18 @@
-"""Path B: confidence belts, baseline intervals, and coverage checks.
+"""Path B: confidence belts, test statistics, baseline intervals, and coverage checks.
 
 This module builds Neyman confidence sets for the signal mu in Theta = [0, mu_max]
 of the on/off Poisson experiment. It provides the exact Feldman-Cousins (FC) belt
-for a known background, simple baseline intervals, and exact or Monte Carlo
+for a known background, Monte Carlo calibrated belts for the profile likelihood
+ratio and WALDO statistics, simple baseline intervals, and exact or Monte Carlo
 coverage estimates. FC and exact coverage use finite Poisson sums. Exact belts
 report outward-rounded hulls, which remove the between-node coverage dips of the
-inclusive hull.
+inclusive hull; the study checks this by exact sums on a 0.001 signal scan.
+Calibrated belts are only checked on a finite (mu, b, eps) grid, up to Monte
+Carlo error.
 """
 
 import os
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import lru_cache
@@ -16,7 +20,7 @@ from functools import lru_cache
 import numpy as np
 from numpy.polynomial.hermite import hermgauss
 from numpy.typing import NDArray
-from scipy.special import gammainc, gammaincc, gammaln, logsumexp, xlogy
+from scipy.special import gammainc, gammaincc, gammaln, logsumexp, ndtr, xlogy
 from scipy.stats import chi2, norm, poisson
 
 from bayesfreq.config import FULL_CONFIG, StudyConfig
@@ -25,18 +29,31 @@ from bayesfreq.interfaces import (
     CoverageResult,
     IntervalBatch,
     IntervalProcedure,
+    PosteriorMoments,
+    PosteriorPredictor,
 )
 
+# T(x, mu0): observations (..., 3) and trial signals mu0 -> statistic values (broadcast).
+TestStatistic = Callable[[NDArray[np.float64], NDArray[np.float64]], NDArray[np.float64]]
+
 __all__ = [
+    "TestStatistic",
     "NeymanBelt",
+    "CalibratedBelt",
     "feldman_cousins_belt",
     "profile_background",
+    "profile_likelihood_statistic",
+    "waldo_statistic",
+    "calibrate_belt",
     "naive_wald_interval",
     "central_neyman_interval",
     "upper_limit_interval",
     "flat_prior_interval",
     "exact_coverage",
     "estimate_coverage",
+    "LocalPosteriorStandIn",
+    "exact_waldo_belt",
+    "refine_belt",
 ]
 
 
@@ -160,6 +177,126 @@ class NeymanBelt:
         if np.any(self.counts[indices] != counts):
             raise ValueError("observed count is absent from belt support")
         return _hull(self.acceptance[:, indices].T, self.mu_grid, outward=True)
+
+
+@dataclass(frozen=True)
+class CalibratedBelt:
+    """Neyman belt for a test statistic, given by critical values on a signal grid.
+
+    Parameters
+    ----------
+    mu_grid : ndarray of float64, shape (G,)
+        Signal grid, increasing and starting at 0.
+    critical_values : ndarray of float64, shape (G,)
+        Critical value ``C(mu)`` at each grid point; may be ``inf``.
+    statistic : TestStatistic
+        ``T(x, mu0)``, with any keyword dependencies already bound.
+    nuisance_grid : ndarray of float64, shape (H, 2)
+        The ``(b, eps)`` rows used to calibrate ``critical_values``.
+    alpha : float
+        Miss probability; the target coverage is ``1 - alpha``.
+    outward : bool, default False
+        If True, report the outward-rounded hull, as ``NeymanBelt`` does. Set
+        by ``exact_waldo_belt``, whose cutoffs come from exact sums on the grid
+        nodes. Monte Carlo belts keep the inclusive hull.
+
+    Notes
+    -----
+    The confidence set is ``CI(x) = {mu0 in mu_grid : T(x; mu0) <= C(mu0)}``.
+    Calibration targets coverage ``>= 1 - alpha`` only at the grid nodes and
+    the listed nuisance rows, up to Monte Carlo error.
+    """
+
+    mu_grid: NDArray[np.float64]
+    critical_values: NDArray[np.float64]
+    statistic: TestStatistic
+    nuisance_grid: NDArray[np.float64]
+    alpha: float
+    outward: bool = False
+
+    def __call__(self, x: NDArray[np.float64]) -> IntervalBatch:
+        """Invert the belt on its own signal grid.
+
+        Parameters
+        ----------
+        x : ndarray of float64, shape (N, 3)
+            Observations ``(n_on, n_off, eps_hat)``.
+
+        Returns
+        -------
+        IntervalBatch
+            Hulls of the accepted grid points (inclusive, or outward-rounded
+            if ``outward``; NaN for empty sets) and the raw membership
+            ``accepted`` of shape (N, G). Raw sets may have holes; they are
+            kept unchanged.
+
+        Raises
+        ------
+        ValueError
+            If ``x`` is invalid or not two-dimensional.
+
+        Notes
+        -----
+        The statistic is evaluated as ``T(x[:, None, :], mu_grid[None, :])`` in
+        blocks of 1024 observations to limit memory use.
+        """
+        obs = _observations(x)
+        if obs.ndim != 2:
+            raise ValueError("belt inversion requires x of shape (N,3)")
+        accepted = np.empty((obs.shape[0], self.mu_grid.size), dtype=np.bool_)
+        for start in range(0, obs.shape[0], 1024):
+            stop = min(start + 1024, obs.shape[0])
+            accepted[start:stop] = (
+                self.statistic(obs[start:stop, None, :], self.mu_grid[None, :])
+                <= self.critical_values
+            )
+        return _hull(accepted, self.mu_grid, outward=self.outward)
+
+
+def refine_belt(belt: CalibratedBelt, mu_grid: NDArray[np.float64]) -> CalibratedBelt:
+    """Move critical values to a finer signal grid using a conservative envelope.
+
+    Parameters
+    ----------
+    belt : CalibratedBelt
+        Belt with critical values on a coarse grid.
+    mu_grid : ndarray of float64, shape (G',)
+        New grid: increasing, starting at 0, and not beyond ``belt.mu_grid[-1]``.
+
+    Returns
+    -------
+    CalibratedBelt
+        Same statistic, nuisance grid, alpha and hull convention, with critical
+        values on ``mu_grid``.
+
+    Raises
+    ------
+    ValueError
+        If ``mu_grid`` is invalid or extends past the calibration grid.
+
+    Notes
+    -----
+    Each coarse value is first raised to the maximum of itself and its two
+    neighbours, ``e_i = max(C_{i-1}, C_i, C_{i+1})`` (end values are repeated).
+    The new values linearly interpolate ``e``. Between two coarse nodes this is
+    at least the larger of the two original cutoffs, so there are no isolated
+    downward spikes. This is a numerical convention; it does not prove
+    coverage between nodes.
+    """
+    grid = _grid(mu_grid)
+    if grid[-1] > belt.mu_grid[-1]:
+        raise ValueError("refinement cannot extrapolate beyond calibration domain")
+    envelope = np.maximum.reduce(
+        [
+            belt.critical_values,
+            np.r_[belt.critical_values[0], belt.critical_values[:-1]],
+            np.r_[belt.critical_values[1:], belt.critical_values[-1]],
+        ]
+    )
+    values = np.interp(grid, belt.mu_grid, envelope)
+    return CalibratedBelt(
+        grid, values, belt.statistic, belt.nuisance_grid, belt.alpha, outward=belt.outward
+    )
 
 
 def _fc_acceptance(
@@ -322,6 +459,245 @@ def profile_background(
         where=discriminant != a,
     )
     return np.where(a >= 0, positive, negative)
+
+
+def _profile_log(
+    x: NDArray[np.float64], mu: NDArray[np.float64], config: StudyConfig
+) -> NDArray[np.float64]:
+    """Return the profile log-likelihood at mu: b in closed form, log eps by Newton.
+
+    Newton runs at most 30 iterations and stops when every log-eps step is
+    <= 1e-10. Each step is clipped to one log unit. No physical eps bound is
+    imposed. Factorials and data-only constants are dropped; they cancel in
+    likelihood ratios.
+    """
+    n, m, eps_hat, mu = np.broadcast_arrays(x[..., 0], x[..., 1], x[..., 2], mu)
+    p = config.problem
+    z0 = np.log(eps_hat)
+    z = z0.copy()
+    if p.sigma_eps > 0:
+        for _ in range(30):
+            s = np.exp(z) * mu
+            b = profile_background(n, m, s, tau=p.tau)
+            rate = s + b
+            ratio = np.divide(n, rate, out=np.zeros_like(rate), where=rate > 0)
+            a = np.divide(n, rate**2, out=np.zeros_like(rate), where=rate > 0)
+            c = np.divide(m, b**2, out=np.zeros_like(b), where=b > 0)
+            # db = d b_hat / d s, by implicit differentiation of the b score.
+            # With m = 0 and b_hat = 0, b_hat stays on the boundary b = 0, so db = 0.
+            db = np.divide(-a, a + c, out=np.zeros_like(a), where=a + c > 0)
+            db = np.where((m == 0) & (b == 0), 0.0, db)
+            score = s * (ratio - 1) - (z - z0) / p.sigma_eps**2
+            hessian = s * (ratio - 1) - s**2 * a * (1 + db) - 1 / p.sigma_eps**2
+            step = np.clip(score / np.minimum(hessian, -1e-8), -1.0, 1.0)
+            z -= step
+            if np.max(np.abs(step), initial=0) <= 1e-10:
+                break
+    s = np.exp(z) * mu
+    b = profile_background(n, m, s, tau=p.tau)
+    value = xlogy(n, s + b) - s - b + xlogy(m, p.tau * b) - p.tau * b
+    if p.sigma_eps > 0:
+        value -= 0.5 * ((z - z0) / p.sigma_eps) ** 2
+    return value
+
+
+def profile_likelihood_statistic(
+    x: NDArray[np.float64],
+    mu: NDArray[np.float64],
+    *,
+    config: StudyConfig = FULL_CONFIG,
+) -> NDArray[np.float64]:
+    """Return the profile likelihood ratio statistic t_mu = -2 log lambda(mu).
+
+    Parameters
+    ----------
+    x : ndarray of float64, shape (..., 3)
+        Observations ``(n_on, n_off, eps_hat)``.
+    mu : ndarray of float64
+        Trial signals (finite, nonnegative), broadcast against ``x[..., 0]``.
+        ``x[:, None, :]`` with ``mu[None, :]`` gives shape (N, G).
+    config : StudyConfig
+        Selects core or full mode and the model constants.
+
+    Returns
+    -------
+    ndarray of float64
+        ``t_mu >= 0`` with the broadcast shape.
+
+    Raises
+    ------
+    ValueError
+        If ``x`` is invalid or ``mu`` is negative or not finite.
+
+    Notes
+    -----
+    ``lambda(mu) = L(mu, b_hat(mu), eps_hat(mu)) / L(mu_hat, b_hat, eps_hat)``.
+    Small negative values from rounding are set to 0.
+
+    - Core mode uses only n_on with ``b = known_b``, and
+      ``mu_hat = clip(n_on - known_b, 0, mu_max)``.
+    - Full mode profiles ``b >= 0`` in closed form (``profile_background``) and
+      ``eps > 0`` by Newton steps in log eps, including the Gaussian term for
+      ``log(eps_hat)``. The denominator uses the MLE restricted to Theta,
+      ``mu_hat = clip((n_on - n_off / tau) / eps_hat, 0, mu_max)``.
+    """
+    obs = _observations(x)
+    trial = np.asarray(mu, dtype=np.float64)
+    if np.any(~np.isfinite(trial)) or np.any(trial < 0):
+        raise ValueError("mu must be finite and nonnegative")
+    p = config.problem
+    if p.mode == "core":
+        n = obs[..., 0]
+        best = np.clip(n - p.known_b, 0, p.mu_max) + p.known_b
+        rate = trial + p.known_b
+        return np.maximum(0.0, 2 * (xlogy(n, best) - best - xlogy(n, rate) + rate))
+    best_mu = np.clip((obs[..., 0] - obs[..., 1] / p.tau) / obs[..., 2], 0, p.mu_max)
+    denominator = _profile_log(obs, best_mu, config)
+    numerator = _profile_log(obs, trial, config)
+    return np.maximum(0.0, 2 * (denominator - numerator))
+
+
+def waldo_statistic(
+    x: NDArray[np.float64],
+    mu: NDArray[np.float64],
+    *,
+    posterior: PosteriorPredictor,
+    variance_floor: float = 1e-8,
+) -> NDArray[np.float64]:
+    """Return the WALDO statistic (E[mu | x] - mu0)^2 / max(Var[mu | x], floor).
+
+    Parameters
+    ----------
+    x : ndarray of float64, shape (..., 3)
+        Observations ``(n_on, n_off, eps_hat)``.
+    mu : ndarray of float64
+        Trial signals mu0, broadcast against ``x[..., 0]``.
+    posterior : PosteriorPredictor
+        Gives the posterior mean and variance of mu for each observation.
+    variance_floor : float, default 1e-8
+        Lower bound on the variance in the denominator; must be positive.
+
+    Returns
+    -------
+    ndarray of float64
+        Statistic values with the broadcast shape.
+
+    Raises
+    ------
+    ValueError
+        If ``x`` is invalid, ``variance_floor <= 0``, or the posterior returns
+        non-finite moments or a negative variance.
+
+    Notes
+    -----
+    The leading axes of ``x`` are flattened to (M, 3) for ``posterior.moments``
+    and then restored, so moments are computed once per observation, not once
+    per trial signal. The posterior applies its own feature transforms.
+    """
+    obs = _observations(x)
+    if variance_floor <= 0:
+        raise ValueError("variance_floor must be positive")
+    moments = posterior.moments(obs.reshape(-1, 3))
+    mean = np.asarray(moments.mean, dtype=np.float64).reshape(obs.shape[:-1])
+    variance = np.asarray(moments.variance, dtype=np.float64).reshape(obs.shape[:-1])
+    if np.any(~np.isfinite(mean)) or np.any(~np.isfinite(variance)) or np.any(variance < 0):
+        raise ValueError("posterior moments must be finite with nonnegative variance")
+    return (mean - mu) ** 2 / np.maximum(variance, variance_floor)
+
+
+def calibrate_belt(
+    statistic: TestStatistic,
+    *,
+    rng: np.random.Generator,
+    mu_grid: NDArray[np.float64] | None = None,
+    nuisance_grid: NDArray[np.float64] | None = None,
+    n_toys: int | None = None,
+    config: StudyConfig = FULL_CONFIG,
+) -> CalibratedBelt:
+    """Calibrate critical values by simulation, taking the maximum over a nuisance grid.
+
+    Parameters
+    ----------
+    statistic : TestStatistic
+        ``T(x, mu0)``; must return one non-NaN value per toy.
+    rng : numpy.random.Generator
+        Stream for the toys. Use a stream independent of later coverage checks.
+    mu_grid : ndarray of float64, optional
+        Calibration grid. Default: 0 to ``mu_max`` at step
+        ``config.grid.mu_step_calib``, with ``mu_max`` included.
+    nuisance_grid : ndarray of float64, shape (H, 2), optional
+        ``(b, eps)`` rows. Default: ``(known_b, 1)`` in core mode; in full mode,
+        each b in ``config.grid.b_cov_grid`` crossed with
+        ``eps0 * exp(k * sigma_eps)``, k = -2..2 (7 x 5 = 35 rows by default).
+    n_toys : int, optional
+        Toys per (mu, b, eps) point. Default: ``config.mc.n_toys_calib``.
+    config : StudyConfig
+        Model, alpha, grids, and budgets.
+
+    Returns
+    -------
+    CalibratedBelt
+        Belt with ``alpha = config.problem.alpha``.
+
+    Raises
+    ------
+    ValueError
+        For an invalid grid, nuisance grid, or ``n_toys``, or if the statistic
+        returns the wrong number of values or any NaN.
+
+    Notes
+    -----
+    For each mu and nuisance row, N toys are simulated (``eps_hat`` is also
+    redrawn). The cutoff is the k-th smallest statistic value (1-based) with
+    ``k = ceil((N + 1)(1 - alpha))``, a conservative quantile. ``C(mu)`` is the
+    maximum of these cutoffs over the nuisance rows. If ``k > N``, every
+    critical value is ``inf``.
+    """
+    p = config.problem
+    grid = _grid(
+        np.unique(np.append(np.arange(0, p.mu_max, config.grid.mu_step_calib), p.mu_max))
+        if mu_grid is None
+        else mu_grid
+    )
+    if nuisance_grid is None:
+        nuisance = (
+            np.array([[p.known_b, 1.0]])
+            if p.mode == "core"
+            else np.array(
+                [
+                    [b, p.eps0 * np.exp(k * p.sigma_eps)]
+                    for b in config.grid.b_cov_grid
+                    for k in (-2, -1, 0, 1, 2)
+                ]
+            )
+        )
+    else:
+        nuisance = np.asarray(nuisance_grid, dtype=np.float64)
+    if (
+        nuisance.ndim != 2
+        or nuisance.shape[1] != 2
+        or nuisance.shape[0] == 0
+        or np.any(~np.isfinite(nuisance))
+        or np.any(nuisance[:, 0] < 0)
+        or np.any(nuisance[:, 1] <= 0)
+    ):
+        raise ValueError("nuisance_grid must be finite (H,2) rows of (b>=0,eps>0)")
+    count = config.mc.n_toys_calib if n_toys is None else n_toys
+    if count < 1 or int(count) != count:
+        raise ValueError("n_toys must be a positive integer")
+    rank = int(np.ceil((count + 1) * (1 - p.alpha)))
+    critical = np.full(grid.size, np.inf)
+    if rank <= count:
+        for i, mu in enumerate(grid):
+            quantiles = []
+            for b, eps in nuisance:
+                x = simulate(mu, b, eps, rng=rng, config=config, size=count)
+                values = np.asarray(statistic(x, np.asarray(mu))).reshape(-1)
+                if values.size != count or np.any(np.isnan(values)):
+                    raise ValueError("statistic must return one non-NaN value per toy")
+                quantiles.append(np.partition(values, rank - 1)[rank - 1])
+            critical[i] = max(quantiles)
+    return CalibratedBelt(grid, critical, statistic, nuisance, p.alpha)
 
 
 def naive_wald_interval(
@@ -597,6 +973,135 @@ def flat_prior_interval(
     lower = grid[np.argmax(cumulative >= config.problem.alpha / 2, axis=1)]
     upper = grid[np.argmax(cumulative >= 1 - config.problem.alpha / 2, axis=1)]
     return IntervalBatch(lower, upper)
+
+
+@dataclass(frozen=True)
+class LocalPosteriorStandIn:
+    """Local posterior predictor for WALDO: exact in core mode, approximate in full.
+
+    Parameters
+    ----------
+    config : StudyConfig, default FULL_CONFIG
+        Problem definition and grids.
+
+    Notes
+    -----
+    Core mode returns the moments of the flat-prior grid posterior on Theta
+    with known b (the posterior behind ``flat_prior_interval``). Full mode is a
+    simple approximation: a Normal distribution truncated to [0, mu_max], with
+    location ``clip(mu_hat, 0, mu_max)`` and variance ``max(1, V)``, where
+    ``mu_hat`` and ``V`` are the full-mode Wald estimate and delta-method
+    variance (see ``naive_wald_interval``). The full mode is not the Path A
+    amortized posterior and must not be reported as such.
+    """
+
+    config: StudyConfig = FULL_CONFIG
+
+    def moments(self, x: NDArray[np.float64]) -> PosteriorMoments:
+        """Return posterior means and variances of mu for each observation.
+
+        Parameters
+        ----------
+        x : ndarray of float64, shape (N, 3)
+            Raw observations ``(n_on, n_off, eps_hat)``.
+
+        Returns
+        -------
+        PosteriorMoments
+            ``mean`` in [0, mu_max] and ``variance >= 0``, each of shape (N,).
+
+        Raises
+        ------
+        ValueError
+            If ``x`` is invalid.
+
+        Notes
+        -----
+        In full mode, with location m, scale s, standardized bounds
+        ``lo = -m / s`` and ``hi = (mu_max - m) / s``, ``Z = Phi(hi) - Phi(lo)``
+        and ``d = (phi(lo) - phi(hi)) / Z``:
+        ``mean = m + s d`` and
+        ``var = s^2 (1 + (lo phi(lo) - hi phi(hi)) / Z - d^2)``.
+        """
+        obs = _observations(x)
+        p = self.config.problem
+        if p.mode == "core":
+            unique, inverse = np.unique(obs[:, 0].astype(int), return_inverse=True)
+            grid = theta_grid(self.config)
+            rows = np.column_stack((unique, np.zeros(unique.size), np.ones(unique.size)))
+            weights = _flat_weights(rows, self.config, grid)
+            mean = weights @ grid
+            variance = np.maximum(0, weights @ grid**2 - mean**2)
+            return PosteriorMoments(mean[inverse], variance[inverse])
+        loc = np.clip((obs[:, 0] - obs[:, 1] / p.tau) / obs[:, 2], 0, p.mu_max)
+        scale = np.sqrt(
+            np.maximum(
+                1, (obs[:, 0] + obs[:, 1] / p.tau**2) / obs[:, 2] ** 2 + loc**2 * p.sigma_eps**2
+            )
+        )
+        a, b = -loc / scale, (p.mu_max - loc) / scale
+        mass = ndtr(b) - ndtr(a)
+        pa, pb = norm.pdf(a), norm.pdf(b)
+        shift = (pa - pb) / mass
+        mean = loc + scale * shift
+        variance = scale**2 * (1 + (a * pa - b * pb) / mass - shift**2)
+        return PosteriorMoments(mean, np.maximum(variance, 0))
+
+
+def exact_waldo_belt(
+    *,
+    posterior: PosteriorPredictor,
+    mu_grid: NDArray[np.float64] | None = None,
+    config: StudyConfig = FULL_CONFIG,
+) -> CalibratedBelt:
+    """Return the core-mode WALDO belt, with critical values from exact Poisson sums.
+
+    Parameters
+    ----------
+    posterior : PosteriorPredictor
+        Posterior used inside the WALDO statistic (default variance floor 1e-8).
+    mu_grid : ndarray of float64, optional
+        Signal grid. Default: ``theta_grid(config)``.
+    config : StudyConfig
+        Must be in core mode.
+
+    Returns
+    -------
+    CalibratedBelt
+        Belt with the bound WALDO statistic, the single nuisance row
+        ``(known_b, 1)`` and ``outward=True``.
+
+    Raises
+    ------
+    ValueError
+        If ``config`` is not in core mode or the grid is invalid.
+
+    Notes
+    -----
+    Counts run over ``poisson_support(mu_grid[-1] + known_b)``, as rows
+    ``(n, 0, 1)``; the off count is an unused integer placeholder because b
+    is known. For each mu, counts are sorted by ascending
+    ``T(n; mu)`` (ties by ascending count) and their probabilities
+    ``Pois(n | mu + known_b)`` are summed. ``C(mu)`` is the statistic value at
+    which this sum first reaches ``1 - alpha``. No Monte Carlo is used. Like
+    the FC belt, the belt reports outward-rounded hulls (see ``NeymanBelt``).
+    """
+    if config.problem.mode != "core":
+        raise ValueError("exact WALDO calibration requires core mode")
+    grid = _grid(theta_grid(config) if mu_grid is None else mu_grid)
+    p = config.problem
+    counts = poisson_support(grid[-1] + p.known_b, tail_prob=config.grid.poisson_tail)
+    x = np.column_stack((counts, np.zeros(counts.size), np.ones(counts.size))).astype(np.float64)
+    statistic = lambda x, mu: waldo_statistic(x, mu, posterior=posterior)  # noqa: E731
+    values = statistic(x[:, None, :], grid[None, :])
+    probabilities = poisson.pmf(counts[:, None], grid[None, :] + p.known_b)
+    order = np.argsort(values, axis=0, kind="stable")
+    cumulative = np.take_along_axis(probabilities, order, axis=0).cumsum(axis=0)
+    crossing = np.argmax(cumulative >= 1 - p.alpha, axis=0)
+    critical = np.take_along_axis(values, order, axis=0)[crossing, np.arange(grid.size)]
+    return CalibratedBelt(
+        grid, critical, statistic, np.array([[p.known_b, 1.0]]), p.alpha, outward=True
+    )
 
 
 def exact_coverage(

@@ -6,21 +6,32 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from scipy.stats import gamma, norm
+from scipy.optimize import brentq, minimize
+from scipy.special import xlogy
+from scipy.stats import chi2, gamma, norm, poisson
 
 from bayesfreq.config import CORE_CONFIG, FULL_CONFIG
 from bayesfreq.data_simulator import poisson_support, simulate, theta_grid
 from bayesfreq.frequentist_bounds import (
+    LocalPosteriorStandIn,
     _fc_acceptance,
     _fc_merge_walk,
+    _hull,
+    calibrate_belt,
     central_neyman_interval,
+    estimate_coverage,
     exact_coverage,
+    exact_waldo_belt,
     feldman_cousins_belt,
     flat_prior_interval,
     naive_wald_interval,
     profile_background,
+    profile_likelihood_statistic,
+    refine_belt,
     upper_limit_interval,
+    waldo_statistic,
 )
+from bayesfreq.interfaces import PosteriorMoments
 
 # Feldman and Cousins (1998), Tables IV–V, 90% CL (physics/9711021): all 420 published
 # intervals, as rows [n0, b, lower, upper]; see tests/data/fc1998_90cl.json.
@@ -127,6 +138,45 @@ def test_corrected_upper_endpoints_do_not_increase_with_background():
     assert np.all(np.diff(uppers, axis=0) <= 1e-12)
 
 
+def test_exact_belts_report_outward_rounded_hulls():
+    belt = feldman_cousins_belt(config=CORE_CONFIG)
+    grid = belt.mu_grid
+    x = np.column_stack((belt.counts, np.zeros(belt.counts.size), np.ones(belt.counts.size)))
+    intervals = belt(x)
+    np.testing.assert_array_equal(intervals.accepted, belt.acceptance.T)
+    first = np.argmax(belt.acceptance, axis=0)
+    last = grid.size - 1 - np.argmax(belt.acceptance[::-1], axis=0)
+    np.testing.assert_array_equal(intervals.lower, grid[np.maximum(first - 1, 0)])
+    np.testing.assert_array_equal(intervals.upper, grid[np.minimum(last + 1, grid.size - 1)])
+    assert intervals.lower[0] == 0 and intervals.upper[-1] == grid[-1]
+    waldo = exact_waldo_belt(posterior=LocalPosteriorStandIn(CORE_CONFIG), config=CORE_CONFIG)
+    rounded = waldo(x)
+    inclusive = _hull(rounded.accepted, waldo.mu_grid)
+    assert waldo.outward and np.all(rounded.lower <= inclusive.lower)
+    assert np.all(rounded.upper >= inclusive.upper)
+    # Refining keeps the hull convention of the belt it refines.
+    assert refine_belt(waldo, waldo.mu_grid).outward
+
+
+def test_exact_core_belts_cover_between_grid_nodes():
+    # Exact sums at a 0.001 step on [0, 10], on and between the 0.01 construction nodes.
+    scan = np.round(np.arange(10001) * 0.001, 9)
+    belts = {
+        "fc": feldman_cousins_belt(config=CORE_CONFIG, enforce_b_monotone=True),
+        "waldo": exact_waldo_belt(posterior=LocalPosteriorStandIn(CORE_CONFIG), config=CORE_CONFIG),
+    }
+    for name, belt in belts.items():
+        coverage = exact_coverage(belt, scan, config=CORE_CONFIG)
+        assert coverage.value.min() >= 0.9, name
+
+        # The inclusive hull of the same sets dips below 0.9 between nodes.
+        def inclusive(x, belt=belt):
+            batch = belt(x)
+            return _hull(batch.accepted, batch.mu_grid)
+
+        assert exact_coverage(inclusive, scan, config=CORE_CONFIG).value.min() < 0.9, name
+
+
 @pytest.mark.parametrize("correct", [False, True])
 def test_bounded_fc_nonempty_monotone_and_exact_coverage(correct):
     belt = feldman_cousins_belt(config=CORE_CONFIG, enforce_b_monotone=correct)
@@ -174,6 +224,31 @@ def test_full_wald_variance_matches_sampling_variance_of_mu_hat():
     assert variance[0] == pytest.approx(mu_hat.var(), rel=0.05)
 
 
+def test_waldo_statistic_definition_with_stub_posterior():
+    class Stub:
+        def moments(self, x):
+            return PosteriorMoments(np.full(len(x), 2.0), np.full(len(x), 4.0))
+
+    value = waldo_statistic(np.array([[3.0, 15.0, 1.0]]), np.array(5.0), posterior=Stub())
+    assert value[0] == pytest.approx((2.0 - 5.0) ** 2 / 4.0)
+
+
+def test_calibrated_cutoff_is_max_over_nuisance_rows():
+    # T = n_on, whose 90% quantile grows with b, so the b = 10 row must decide.
+    def statistic(x, mu):
+        return x[..., 0] + 0 * mu
+
+    belt = calibrate_belt(
+        statistic,
+        rng=np.random.default_rng(0),
+        mu_grid=np.array([0.0, 5.0]),
+        nuisance_grid=np.array([[0.5, 1.0], [10.0, 1.0]]),
+        n_toys=2000,
+    )
+    for mu, cut in zip(belt.mu_grid, belt.critical_values, strict=True):
+        assert abs(cut - poisson.ppf(0.9, mu + 10.0)) <= 1
+
+
 def test_profile_background_closed_form_and_zero_boundary():
     n, m, mu = (
         np.array([2.0, 8.0, 0.0, 4.0]),
@@ -184,6 +259,58 @@ def test_profile_background_closed_form_and_zero_boundary():
     expected = (a + np.sqrt(a**2 + 24 * m * mu)) / 12
     np.testing.assert_allclose(profile_background(n, m, mu), expected, atol=1e-12)
     assert profile_background(np.array(0.0), np.array(0.0), np.array(1e10)) == 0
+
+
+def test_rolke_bounded_likelihood_regression():
+    config = replace(FULL_CONFIG, problem=replace(FULL_CONFIG.problem, sigma_eps=0.0))
+    x = np.array([[2.0, 15.0, 1.0]])
+    limit = brentq(
+        lambda mu: (
+            profile_likelihood_statistic(x, np.array(mu), config=config)[0] - chi2.ppf(0.95, 1)
+        ),
+        1,
+        8,
+    )
+    # Regression value for this bounded profile-likelihood calculation.
+    assert limit == pytest.approx(3.6, abs=0.05)
+
+
+@pytest.mark.parametrize("counts", [(2, 15), (8, 15), (40, 1), (0, 0), (3, 0)])
+def test_full_profile_against_independent_optimizer(counts):
+    n, m = counts
+    x = np.array([[float(n), float(m), 1.13]])
+    mu = 3.2
+    p = FULL_CONFIG.problem
+
+    def loglike(signal, b, z):
+        rate = np.exp(z) * signal + b
+        return (
+            xlogy(n, rate)
+            - rate
+            + xlogy(m, p.tau * b)
+            - p.tau * b
+            - 0.5 * ((z - np.log(1.13)) / p.sigma_eps) ** 2
+        )
+
+    fixed = minimize(
+        lambda y: -loglike(mu, y[0], y[1]),
+        [max(0.01, m / p.tau), np.log(1.13)],
+        method="Nelder-Mead",
+        bounds=[(0, None), (None, None)],
+        options={"xatol": 1e-10, "fatol": 1e-10, "maxiter": 3000},
+    )
+    mle_mu = np.clip((n - m / p.tau) / 1.13, 0, p.mu_max)
+    free = minimize(
+        lambda y: -loglike(y[0], y[1], y[2]),
+        [mle_mu, max(0.01, m / p.tau), np.log(1.13)],
+        method="Nelder-Mead",
+        bounds=[(0, p.mu_max), (0, None), (None, None)],
+        options={"xatol": 1e-10, "fatol": 1e-10, "maxiter": 3000},
+    )
+    assert fixed.success and free.success
+    expected = max(0, 2 * (fixed.fun - free.fun))
+    actual = profile_likelihood_statistic(x, np.array(mu))[0]
+    assert actual == pytest.approx(expected, abs=1e-7)
 
 
 def test_flat_core_posterior_matches_truncated_gamma():
@@ -203,3 +330,99 @@ def test_full_flat_posterior_quadrature_converges():
     fine = flat_prior_interval(x, config=finer)
     np.testing.assert_allclose(coarse.lower, fine.lower, atol=0.015)
     np.testing.assert_allclose(coarse.upper, fine.upper, atol=0.015)
+
+
+def test_exact_core_waldo_and_broadcast_interface():
+    posterior = LocalPosteriorStandIn(CORE_CONFIG)
+    grid = np.linspace(0, 10, 101)
+    belt = exact_waldo_belt(posterior=posterior, mu_grid=grid, config=CORE_CONFIG)
+    x = np.array([[0.0, 15.0, 1.0], [4.0, 15.0, 1.0]])
+    values = waldo_statistic(x[:, None, :], grid[None, :], posterior=posterior)
+    assert values.shape == (2, 101)
+    result = exact_coverage(belt, grid, config=CORE_CONFIG)
+    assert np.min(result.value) >= 0.9 - 1e-12
+
+
+def test_seeded_calibration_and_coverage_reproducible():
+    grid = np.array([0.0, 1.0, 5.0, 10.0])
+
+    def statistic(x, mu):
+        return profile_likelihood_statistic(x, mu, config=CORE_CONFIG)
+
+    first = calibrate_belt(
+        statistic, rng=np.random.default_rng(42), mu_grid=grid, n_toys=120, config=CORE_CONFIG
+    )
+    second = calibrate_belt(
+        statistic, rng=np.random.default_rng(42), mu_grid=grid, n_toys=120, config=CORE_CONFIG
+    )
+    np.testing.assert_array_equal(first.critical_values, second.critical_values)
+    theta = np.array([[0.0, 3.0, 1.0], [5.0, 3.0, 1.0]])
+    a = estimate_coverage(
+        first, theta, rng=np.random.default_rng(71), n_samples=100, config=CORE_CONFIG
+    )
+    b = estimate_coverage(
+        first, theta, rng=np.random.default_rng(71), n_samples=100, config=CORE_CONFIG
+    )
+    np.testing.assert_array_equal(a.value, b.value)
+    np.testing.assert_array_equal(a.expected_length, b.expected_length)
+    np.testing.assert_allclose(a.mc_se, np.sqrt(a.value * (1 - a.value) / 100))
+    refined = refine_belt(first, np.array([0.0, 0.5, 1.0, 3.0, 5.0, 10.0]))
+    envelope = np.maximum.reduce(
+        [
+            first.critical_values,
+            np.r_[first.critical_values[0], first.critical_values[:-1]],
+            np.r_[first.critical_values[1:], first.critical_values[-1]],
+        ]
+    )
+    assert refined.critical_values[1] == pytest.approx((envelope[0] + envelope[1]) / 2)
+    assert refined.critical_values[2] == envelope[1]
+
+
+def test_small_calibration_budget_has_infinite_conservative_cutoff():
+    def statistic(x, mu):
+        return np.zeros(x.shape[0])
+
+    belt = calibrate_belt(
+        statistic,
+        rng=np.random.default_rng(1),
+        n_toys=1,
+        mu_grid=np.array([0.0, 10.0]),
+        config=CORE_CONFIG,
+    )
+    assert np.all(np.isinf(belt.critical_values))
+
+
+def test_mc_resamples_auxiliary_efficiency():
+    x = simulate(2, 3, rng=np.random.default_rng(123), size=100)
+    assert np.std(x[:, 2]) > 0.05
+    assert np.all(profile_likelihood_statistic(x, np.array(2.0)) >= 0)
+
+
+def test_full_stand_in_is_conditional_and_has_bounded_finite_moments():
+    x = np.array([[0.0, 15.0, 0.9], [5.0, 20.0, 1.1], [30.0, 2.0, 1.0]])
+    posterior = LocalPosteriorStandIn(FULL_CONFIG)
+    batch = posterior.moments(x)
+    assert np.all((batch.mean >= 0) & (batch.mean <= 10))
+    assert np.all(np.isfinite(batch.variance)) and np.all(batch.variance >= 0)
+    for i in range(x.shape[0]):
+        single = posterior.moments(x[i : i + 1])
+        assert single.mean[0] == pytest.approx(batch.mean[i], abs=1e-12)
+        assert single.variance[0] == pytest.approx(batch.variance[i], abs=1e-12)
+    values = waldo_statistic(x[:, None, :], np.array([[0.0, 5.0, 10.0]]), posterior=posterior)
+    assert values.shape == (3, 3) and np.all(np.isfinite(values))
+
+
+def test_full_nuisance_calibration_is_seeded_reproducible():
+    kwargs = {
+        "mu_grid": np.array([0.0, 5.0, 10.0]),
+        "n_toys": 80,
+        "nuisance_grid": np.array([[0.5, 1.0], [3.0, 1.0], [10.0, 1.0]]),
+    }
+    a = calibrate_belt(profile_likelihood_statistic, rng=np.random.default_rng(18), **kwargs)
+    b = calibrate_belt(profile_likelihood_statistic, rng=np.random.default_rng(18), **kwargs)
+    np.testing.assert_array_equal(a.critical_values, b.critical_values)
+    assert np.all(np.isfinite(a.critical_values))
+    theta = np.array([[0.0, 0.5, 1.0], [5.0, 3.0, 1.0]])
+    result = estimate_coverage(a, theta, rng=np.random.default_rng(20), n_samples=100)
+    assert np.all(np.isfinite(result.expected_length))
+    assert np.all(result.length_mc_se >= 0)
