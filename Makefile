@@ -2,7 +2,7 @@ PYTHON := .venv/bin/python
 UV := uv
 TORCH_INDEX := https://download.pytorch.org/whl/cpu
 
-.PHONY: setup test test-all lint path-a
+.PHONY: setup test test-all lint path-a path-b
 
 setup:
 	$(UV) venv --python 3.12 --allow-existing .venv
@@ -22,3 +22,6 @@ lint:
 
 path-a:
 	$(PYTHON) scripts/run_path_a.py
+
+path-b:
+	$(PYTHON) scripts/run_path_b.py
