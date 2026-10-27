@@ -1,6 +1,6 @@
 # Shared API contract
 
-Version: 1.1, 2026-10-12. This file is the API contract shared by the Path A
+Version: 1.2, 2026-10-20. This file is the API contract shared by the Path A
 (Bayesian) and Path B (frequentist) code. The problem is the on/off Poisson
 experiment described below. The sources for the constants and methods are in
 `docs/literature_review.md` and `docs/references.bib`.
@@ -20,23 +20,47 @@ experiment described below. The sources for the constants and methods are in
 - **Reality prior.** A 0.3 point mass at `mu = 0` plus a log-uniform component on
   `[0.1, 10]`. The prior-sensitivity study varies the weight (0.1, 0.5) and the
   cutoff (0.03, 0.3), and adds flat and Gamma analysis priors.
-- **Nuisance box.** Path B checks coverage only at grid points inside
+- **Nuisance box.** Path B checks coverage only at points inside
   `b in [0.5, 10]` × `eps in eps0*exp([-2, +2]*sigma_eps)` (about ±20% in
-  efficiency). It makes no coverage claim outside this box or between grid
-  points. Critical values take the maximum over 7 background values ×
-  5 efficiency values. A calibration at `eps0` only (efficiency fixed at 1) is
-  kept as an ablation.
+  efficiency). It makes no coverage claim outside this box. Critical values
+  take the maximum over 7 background values × 5 efficiency values. The main
+  check grids reuse these calibration nodes, where coverage of about 0.90 holds
+  by construction, so they mostly test the implementation. The test of the
+  nuisance maximum is a set of points off the nodes: 45 off-grid points and
+  300 random points drawn uniformly in `mu`, `log b` and `log eps` inside the
+  box. A calibration at `eps0` only (efficiency fixed at 1) is kept as an
+  ablation and is checked at the same random points.
 - **Coverage criterion.** The target is 90% coverage. It is checked point by
   point on finite grids. The Monte Carlo tolerance is 0.015 at 4,000 toys per
   point (about 3 MC s.e.), so a point passes when its estimated coverage is at
   least 0.885. Flagged points are rerun with 10× more toys before they count as
-  failures. Exact (summed) coverage in the core case uses tolerance 0.005. A pass
-  is empirical evidence on the checked grid, not a proof of coverage.
-- **FC monotone fix.** FC force the upper endpoint to be non-increasing in `b`
-  to produce their published tables. The library option `enforce_b_monotone`
-  (default `False`) applies this correction when set to `True`, and only for
-  `n_on = 0`, which is the row where the plain construction differs from the
-  tables.
+  failures; the rerun uses the same threshold. The rule is built to avoid false
+  failures, not to detect small shortfalls: its exact operating characteristic
+  (binomial tail sums) is stored in the results, and a point with true coverage
+  0.89 passes with probability about 1. A pass therefore means that no checked
+  point is clearly below about 0.885; it does not prove 0.90. Exact (summed)
+  coverage in the core case uses tolerance 0.005. For the exact FC and core
+  WALDO belts it is evaluated on a signal scan of step 0.001, on and between the
+  0.01 construction nodes, because coverage at the nodes holds by construction.
+  A pass is empirical evidence on the checked points, not a proof of coverage.
+  Reported minima are the lowest of many noisy estimates and are biased low;
+  the five lowest points of each main grid are re-estimated with fresh toys.
+- **FC monotone fix.** For a fixed count, the plain FC upper endpoint is not
+  always non-increasing in `b`. FC (1998, Sec. IV A) "force the function to be
+  non-increasing, by lengthening selected confidence intervals as necessary",
+  over a fine grid of `b` in `[0, 25]`, and their published tables include this
+  correction. The library option `enforce_b_monotone` (default `False`) applies
+  it to every count: the corrected upper endpoint is the largest plain upper
+  endpoint over `b' >= b` on the auxiliary grid `{b} ∪ {0, 0.01, ..., 25}`, and
+  the count is accepted at every grid point from its plain lower endpoint up to
+  that value. With the correction, all 420 entries of FC Tables IV–V
+  (90% C.L.) match within 0.01; without it, 361 do. The study's core FC belt
+  uses the correction.
+- **Exact-belt endpoints.** Exact belts (FC and the core WALDO belt) report
+  outward-rounded endpoints, as FC do: the lower end is the grid node just
+  below the lowest accepted node, and the upper end the node just above the
+  highest one, within `[0, mu_max]`. Calibrated Monte Carlo belts report the
+  inclusive hull.
 
 Path A and Path B implement the signatures below; final inference and experiment
 code is available in the package and runners.
@@ -192,11 +216,14 @@ seven background values crossed with five log-efficiency offsets `[-2,-1,0,1,2]`
 This study box does not truncate the simulator or the Bayesian efficiency prior.
 A calibration at `eps0` only is kept as a documented ablation.
 `eps_log_span=5`
-is a numerical integration/support envelope, never a physical bound.
+is recorded in the config as a numerical envelope, never a physical bound; the
+code does not read it. The efficiency quadrature range follows from the
+Gauss–Hermite node count (`eps_points`).
 For finite count sums call `poisson_support` with an explicit rate envelope,
 e.g. `eps0*exp(5*sigma_eps)*mu_max+b_max`, and report the omitted tail.
 The default helper tail target is `1e-12`.
-FC validation uses `theta_grid(validation=True)` and counts 0 through 150.
+FC validation uses `theta_grid(validation=True)` and counts 0 through
+`n_fc_max` (150).
 Plots use the seaborn colorblind palette, ticks style, and 150 dpi. Each
 method keeps one colour and one display name in every figure (`METHOD_COLORS`
 and `METHOD_LABELS`).
@@ -230,10 +257,12 @@ length zero. `RiskResult.mc_se` and `length_mc_se` are sample s.d. (`ddof=1`)
 divided by the square root of the toy count. Probability errors use
 `sqrt(p*(1-p)/n)`.
 
-Coverage and expected lengths describe the reported inclusive hull. Keep raw
-acceptance grids for nonconvex-set diagnostics and label any raw-set coverage
-separately. A hull can cover when the raw set does not. No continuous-domain
-guarantee follows from a finite grid alone.
+Coverage and expected lengths describe the reported hull: inclusive for
+calibrated Monte Carlo belts, outward-rounded for exact belts (`NeymanBelt`, and
+`CalibratedBelt` with `outward=True`). Keep raw acceptance grids for
+nonconvex-set diagnostics and label any raw-set coverage separately. A hull can
+cover when the raw set does not. No continuous-domain guarantee follows from a
+finite grid alone.
 
 ## Path A public API (implemented)
 
@@ -287,15 +316,20 @@ not a conjugacy claim for background-subtracted counts. Its analysis prior is a
 diffuse Gamma(shape 1, rate 0.1) with no atom at zero, not the reality prior,
 and it fixes the nuisances at `b_hat = n_off/tau` and `eps_hat`. Laplace keeps
 the reality prior but also plugs in the nuisances. SBC for all four samplers
-uses the reality prior as its reference, so the Gamma and Laplace SBC results
-combine prior or model mismatch with approximation error; they do not measure
-numerical accuracy alone. Laplace must handle the point mass and the physical
-boundaries explicitly or state its limitation.
+uses the reality prior as its reference and the same 1,000 prior draws, so the
+four p-values are not independent tests. The Gamma and Laplace SBC results do
+not measure numerical accuracy alone. Gamma's rejection comes mainly from its
+prior: it has no atom at zero, so every `mu = 0` truth gets rank 0. Laplace's
+comes from its expansion in `mu`: the log-uniform prior adds a `-log(mu)` term
+to the log posterior, which can create a spurious mode at the lower prior
+cutoff 0.1. Expanding in `log(mu)`, where that prior is flat, would avoid it.
+Laplace must handle the point mass and the physical boundaries explicitly or
+state its limitation.
 
 Additional public helpers used by the Path A runner:
 
 ```python
-GridPosterior.hpd_intervals(*, alpha: float = 0.1) -> IntervalBatch  # smallest-volume grid set + hull
+GridPosterior.hpd_intervals(*, alpha: float = 0.1) -> IntervalBatch  # atom-first grid set + hull
 GammaPluginPosterior(config=FULL_CONFIG, shape=1.0, rate=0.1)  # sampler for SBC
 GammaPluginPosterior.sample(x, n_draws, *, rng) -> FloatArray
 LaplacePosterior(config=FULL_CONFIG, prior=None)                # sampler for SBC
@@ -305,6 +339,14 @@ time_inference(estimator: PointEstimator, x: FloatArray, *, repeats: int = 7) ->
 
 `time_inference` returns the median batched time per observation in
 microseconds; it is a deterministic measurement, not a Monte Carlo estimate.
+
+`hpd_intervals` ranks nodes by mass per unit signal length. The atom at zero
+has zero length, so whenever its posterior weight is positive it ranks first.
+Under the reality prior that weight is always positive, so the set always
+contains 0 and its hull always starts at 0, even when the atom's weight is
+tiny. For a mixed atom-plus-continuous posterior this is not a highest-density
+set in the usual sense; the reported `hpd_hull_summary` describes these
+`[0, U]` hulls and is not used for any headline result.
 
 ## Exact Path A to Path B bridge
 
@@ -331,11 +373,12 @@ uses Path A's trained model. `make all` runs Path A before Path B to supply it.
 # frequentist_bounds.py
 TestStatistic = Callable[[FloatArray, FloatArray], FloatArray]  # T(x, mu0)
 NeymanBelt(mu_grid: FloatArray, counts: IntArray, acceptance: NDArray[np.bool_])
-NeymanBelt.__call__(x: FloatArray) -> IntervalBatch
+NeymanBelt.__call__(x: FloatArray) -> IntervalBatch  # outward-rounded hull
 CalibratedBelt(mu_grid: FloatArray, critical_values: FloatArray,
-               statistic: TestStatistic, nuisance_grid: FloatArray, alpha: float)
-CalibratedBelt.__call__(x: FloatArray) -> IntervalBatch
-feldman_cousins_belt(*, b: float = 3.0, alpha: float = 0.1,
+               statistic: TestStatistic, nuisance_grid: FloatArray, alpha: float,
+               outward: bool = False)
+CalibratedBelt.__call__(x: FloatArray) -> IntervalBatch  # inclusive hull unless outward
+feldman_cousins_belt(*, b: float = 3.0, alpha: float | None = None,
                      mu_grid: FloatArray | None = None, n_max: int | None = None,
                      enforce_b_monotone: bool = False,
                      config: StudyConfig = FULL_CONFIG) -> NeymanBelt
@@ -349,10 +392,12 @@ calibrate_belt(statistic: TestStatistic, *, rng: Generator,
                mu_grid: FloatArray | None = None, nuisance_grid: FloatArray | None = None,
                n_toys: int | None = None, config: StudyConfig = FULL_CONFIG) -> CalibratedBelt
 naive_wald_interval(x: FloatArray, *, config: StudyConfig = FULL_CONFIG) -> IntervalBatch
-central_neyman_interval(x: FloatArray, *, b: float = 3.0, alpha: float = 0.1,
+central_neyman_interval(x: FloatArray, *, b: float = 3.0, alpha: float | None = None,
                         config: StudyConfig = FULL_CONFIG) -> IntervalBatch
-upper_limit_interval(x: FloatArray, *, b: float = 3.0, alpha: float = 0.1,
+upper_limit_interval(x: FloatArray, *, b: float = 3.0, alpha: float | None = None,
                       config: StudyConfig = FULL_CONFIG) -> IntervalBatch
+# alpha=None means config.problem.alpha (0.10 by default) in feldman_cousins_belt,
+# central_neyman_interval and upper_limit_interval
 flat_prior_interval(x: FloatArray, *, config: StudyConfig = FULL_CONFIG) -> IntervalBatch
 exact_coverage(procedure: IntervalProcedure, mu_grid: FloatArray, *, b: float = 3.0,
                n_max: int | None = None, config: StudyConfig = FULL_CONFIG) -> CoverageResult
@@ -378,13 +423,15 @@ The public helper `refine_belt(belt, mu_grid) -> CalibratedBelt` implements this
 convention; it is not a theorem about between-node coverage. Exact core WALDO thresholds
 can be obtained by summing the count support, with no MC calibration.
 The FC b-monotone option defaults to false and may lengthen upper endpoints.
-State its auxiliary b grid and test the published n_on=0 reference rows.
+It covers every count, uses the auxiliary b grid 0..25 at step 0.01, and is
+tested against all 420 published entries of FC Tables IV–V
+(`tests/data/fc1998_90cl.json`).
 
 Additional public helpers used by the Path B runner:
 
 ```python
 exact_waldo_belt(*, posterior: PosteriorPredictor, mu_grid: FloatArray | None = None,
-                 config: StudyConfig = FULL_CONFIG) -> CalibratedBelt  # core: exact Poisson sums
+                 config: StudyConfig = FULL_CONFIG) -> CalibratedBelt  # core: exact sums, outward=True
 LocalPosteriorStandIn(config=FULL_CONFIG)  # exact flat-grid posterior in core mode
 LocalPosteriorStandIn.moments(x: FloatArray) -> PosteriorMoments
 ```
@@ -410,7 +457,8 @@ The complete payloads use this envelope:
   "seed": 20261012,
   "config": {"problem": {}, "grid": {}, "mc": {}, "seed": 20261012},
   "runtime_seconds": 0.0,
-  "environment": {"python": "version", "numpy": "version", "torch": "version"},
+  "environment": {"python": "version", "numpy": "version", "torch": "version",
+                  "platform": "platform.platform()", "machine": "platform.machine()"},
   "methods": {},
   "diagnostics": {},
   "artifacts": {"figures": [], "model": null},
@@ -446,8 +494,9 @@ An unavailable rate stays null; serialization does not add statistical estimates
 The ablation calibrated at `eps0` only (key `eps0_ablation`), the efficiency-box
 checks, and the off-grid checks keep compact verdicts. Calibration grids, cutoffs, initial toy records, rerun rows,
 flagged-point lists, and other per-point arrays live in the gzip payload.
-The summary keeps calibration node counts and nuisance bounds, and keeps the
-FC other-count monotonicity violation count rather than its full list.
+The summary keeps calibration node counts and nuisance bounds, all 420 FC
+table comparisons, and the FC b-monotonicity violation counts (plain and
+corrected) rather than their full lists.
 
 Readers needing curves or per-point diagnostics, including the notebook and
 figure regeneration, load the complete payload with the standard library:
@@ -524,6 +573,23 @@ quadrature convergence, count truncation mass, calibration sample size,
 RNG stream seeds, critical-value interpolation, variance floor, and
 disconnected-set counts where relevant. Passing SBC is not a fixed-theta
 coverage guarantee. A finite-grid coverage pass is not a continuous theorem.
+
+Version 1.2 adds these fields. None of them changes an earlier number.
+
+| Path | Field | Content |
+| --- | --- | --- |
+| A | `methods.<m>.paired_vs_exact_grid` | per-draw squared and absolute loss differences against `exact_grid` (mean and paired SE), and `excess_squared_risk` = mean of `(d - d_grid)**2` |
+| A | `diagnostics.prior_sensitivity.<prior>.paired` | `vs_reality` and `vs_clipped_mle` paired differences on the same draws |
+| A | `interval_summary.posterior_content`, `lower_at_zero_rate` | mean posterior mass inside the reported interval, and the share of intervals that start at 0 (also per fixed-theta coverage row) |
+| A | `methods.amortized.paired_coverage_vs_exact_grid` | per-point neural minus grid coverage on shared toys, with paired SE |
+| A | `max_grid_risk_common_slice` | maximum risk over the `b = known_b` rows, which every method has |
+| A | `diagnostics.neural_vs_exact_posterior` | mean KL(exact ‖ neural) after binning the grid posterior into the network's 101 classes, its 95th percentile, and posterior-variance agreement |
+| B | `diagnostics.core_off_node_scan` | exact core coverage on a 0.001 signal scan, with minimum and argmin |
+| B | `diagnostics.random_box_check` | 300 random off-node points for both calibrated methods and both `eps0`-only ablations, same toys per point |
+| B | `diagnostics.calibration_node_overlap` | how many check points coincide with calibration nodes |
+| B | `diagnostics.reestimated_minima` | the 5 lowest points of each main grid re-estimated with 40,000 fresh toys |
+| B | `diagnostics.pass_rule_characteristic` | exact probabilities of an initial flag and of a final pass, by true coverage |
+| B | `diagnostics.fc_reference_checks` | all 420 table entries, plain and corrected |
 
 ## Tooling and execution
 

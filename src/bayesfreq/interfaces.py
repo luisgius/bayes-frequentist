@@ -122,10 +122,11 @@ class IntervalBatch:
 
     Notes
     -----
-    The hull is ``[min accepted mu, max accepted mu]``. Coverage of a
-    reported hull uses the endpoints; coverage of a raw set uses
-    ``accepted``. A hull can cover when the raw set does not, so reports
-    must say which one they use.
+    The hull is ``[min accepted mu, max accepted mu]``, or, for exact belts,
+    that range widened by one grid node on each side (outward rounding; see
+    the producing belt). Coverage of a reported hull uses the endpoints;
+    coverage of a raw set uses ``accepted``. A hull can cover when the raw
+    set does not, so reports must say which one they use.
     """
 
     lower: NDArray[np.float64]
