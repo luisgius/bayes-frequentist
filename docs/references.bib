@@ -1,6 +1,7 @@
 % references.bib -- Pragmatic Bayes and Bounded Frequentism
 % Every entry was opened on 2026-10-12 (arXiv API record or PDF, Crossref record,
-% publisher page, or Semantic Scholar record). The note field says what was checked.
+% publisher page, or Semantic Scholar record); three entries were rechecked on 2026-10-20.
+% The note field says what was checked.
 % "metadata" = title, authors, year and venue checked; "abstract"/"full text" = content checked.
 
 % ---------------------------------------------------------------------------
@@ -209,11 +210,15 @@
   author    = {Masserano, Luca and Dorigo, Tommaso and Izbicki, Rafael and Kuusela, Mikael and Lee, Ann B.},
   title     = {Simulator-Based Inference with {WALDO}: Confidence Regions by Leveraging Prediction Algorithms and Posterior Estimators for Inverse Problems},
   booktitle = {Proceedings of the 26th International Conference on Artificial Intelligence and Statistics (AISTATS)},
-  series    = {PMLR},
+  series    = {Proceedings of Machine Learning Research},
+  volume    = {206},
+  pages     = {2960--2974},
+  publisher = {PMLR},
   year      = {2023},
+  url       = {https://proceedings.mlr.press/v206/masserano23a.html},
   eprint    = {2205.15680},
   archivePrefix = {arXiv},
-  note      = {verified 2026-10-12 (full text PDF, Sec. 3.2 and Algorithm 1)}
+  note      = {verified 2026-10-12 (full text PDF, Sec. 3.2 and Algorithm 1); volume and pages verified 2026-10-20 (PMLR proceedings page)}
 }
 
 @misc{masserano2024nuisance,
@@ -239,14 +244,18 @@
   note    = {verified 2026-10-12 (arXiv abstract; Crossref metadata; full author list not checked)}
 }
 
-@misc{carzon2025focusing,
-  author  = {Carzon, James and Ghosh, Aishik and Izbicki, Rafael and Lee, Ann and Masserano, Luca and Whiteson, Daniel},
+@article{carzon2025focusing,
+  author  = {Carzon, James and Ghosh, Aishik and Izbicki, Rafael and Lee, Ann B. and Masserano, Luca and Whiteson, Daniel},
   title   = {On Focusing Statistical Power for Searches and Measurements in Particle Physics},
-  year    = {2025},
+  journal = {The European Physical Journal C},
+  volume  = {86},
+  number  = {7},
+  pages   = {790},
+  year    = {2026},
   doi     = {10.1140/epjc/s10052-026-16023-1},
   eprint  = {2507.17831},
   archivePrefix = {arXiv},
-  note    = {verified 2026-10-12 (arXiv abstract and DOI field)}
+  note    = {verified 2026-10-12 (arXiv abstract); journal version verified 2026-10-20 (Crossref metadata: title, authors, volume, issue, article number 790). The key keeps the year of the arXiv preprint (2025)}
 }
 
 @misc{alkadhim2023alffi,
@@ -487,9 +496,11 @@
   title   = {Minimax Estimation of the Mean of a Normal Distribution when the Parameter Space is Restricted},
   journal = {The Annals of Statistics},
   volume  = {9},
+  number  = {6},
+  pages   = {1301--1309},
   year    = {1981},
   doi     = {10.1214/aos/1176345646},
-  note    = {verified 2026-10-12 (Crossref metadata only)}
+  note    = {verified 2026-10-12 (Crossref metadata); abstract checked 2026-10-20: for |theta| <= m the minimax risk is 1 - pi^2/m^2 + o(m^-2), with an approximately cos^2-shaped least favourable prior. Cited for the large-interval asymptotics, not for the two-point result}
 }
 
 @article{stark2015constraints,

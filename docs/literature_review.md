@@ -1,7 +1,8 @@
 # Literature review: pragmatic Bayes and bounded frequentism
 
-*Status: checked against sources opened on 2026-10-12. Citation keys such as
-`[@feldman1998unified]` refer to `docs/references.bib`.*
+*Status: checked against sources opened on 2026-10-12; three citations were
+rechecked on 2026-10-20. Citation keys such as `[@feldman1998unified]` refer to
+`docs/references.bib`.*
 
 ## 1. The question behind this repository
 
@@ -49,11 +50,14 @@ is the best *physically allowed* fit. This gives one coherent set of intervals. 
 moves smoothly from upper limits (small $n$) to two-sided intervals (large $n$), and
 it never returns an empty interval. Because $n$ is discrete, the intervals still
 overcover a little; no ordering rule can avoid that. FC published tables of
-intervals for many $(n_0, b)$ pairs, which makes the method easy to test. This
-repository compares 27 selected intervals from Tables IV–V with its own
-construction; it does not check every table entry. Their paper
-also documents two small "pathologies" and how they handled them, which matters if
-you want to reproduce the tables exactly (see `docs/DESIGN.md`).
+intervals for many $(n_0, b)$ pairs, which makes the method easy to test. Their
+paper also documents two small "pathologies" and how they handled them, which
+matters if you want to reproduce the tables exactly. In particular, for a fixed
+$n_0$ the plain upper endpoint does not always decrease as $b$ grows, so FC "force
+the function to be non-increasing, by lengthening selected confidence intervals as
+necessary" [@feldman1998unified, Sec. IV A]. With this correction applied to every
+count, this repository's construction matches all 420 entries of Tables IV–V
+(90% C.L., $n_0 = 0$ to 20, $b = 0$ to 15) within 0.01 (see `docs/DESIGN.md`).
 
 ### 3.2 Critiques and alternatives
 
@@ -103,8 +107,11 @@ $r(\pi,\delta)$ averages that risk over a prior $\pi$. A *minimax* estimator
 minimises the worst-case risk. Bounded parameter spaces make these ideas concrete.
 For a normal mean restricted to a short interval, the unique minimax estimator under
 squared error is the Bayes rule for a *two-point prior* on the endpoints
-[@casella1981bounded; @bickel1981minimax]. So in the bounded world, "frequentist
-worst case" and "Bayes under a well-chosen prior" can lead to the same estimator.
+[@casella1981bounded]. For long intervals, Bickel found the minimax risk
+asymptotically; the least favourable prior is then close to a smooth
+cosine-squared shape, not uniform [@bickel1981minimax]. So in the bounded world,
+"frequentist worst case" and "Bayes under a well-chosen prior" can lead to the
+same estimator.
 
 The same bridge exists for intervals. Pratt studied the expected length of
 confidence intervals [@pratt1961length]. Schafer and Stark built confidence sets of
@@ -182,9 +189,9 @@ calibration by simulation is the safer choice.
    in all three literatures: physics intervals, decision theory, and SBI with
    guarantees. Exact FC tables let us test the core case.
 2. **Path A** should report Bayes risk *and* frequentist risk, and check the neural
-   estimator with SBC. Passing SBC does not prove coverage, and a method with a
-   different analysis prior can fail SBC under the reference prior for that reason
-   alone.
+   estimator with SBC and, because an exact posterior is available here, directly
+   against it. Passing SBC does not prove coverage, and a method with a different
+   analysis prior can fail SBC under the reference prior for that reason alone.
 3. **Path B** should reproduce FC and calibrate profile-likelihood and WALDO
    statistics by simulation over a $(\mu, b)$ grid. It should report the coverage
    function with Monte Carlo error bars and judge it against a stated pass
@@ -192,5 +199,10 @@ calibration by simulation is the safer choice.
    that the papers prove under their own assumptions.
 4. **Reconciliation.** WALDO and its relatives show the pragmatic middle ground. In
    that view, the prior affects how *small* the confidence set is, and accurate
-   calibration is what controls its *coverage*. This repository checks coverage by
-   simulation on finite grids; that is empirical evidence, not a proof.
+   calibration is what controls its *coverage*. In this repository the coverage pass
+   comes from the simulation calibration, which makes any statistic pass at the
+   calibration nodes; off the nodes both statistics passed. The profile likelihood
+   ratio passes the same checks, and the WALDO sets are not shorter. What the
+   study shows is that a fast neural posterior can be plugged into a valid
+   procedure. It checks coverage by simulation on finite grids; that
+   is empirical evidence, not a proof.
