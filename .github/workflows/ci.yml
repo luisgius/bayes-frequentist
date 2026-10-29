@@ -24,3 +24,5 @@ jobs:
       - run: ruff check .
       - run: ruff format --check .
       - run: python -m pytest -q -o addopts=""
+      - name: Execute notebook
+        run: python -m nbconvert --execute --to notebook --output-dir "$RUNNER_TEMP" notebooks/01_holy_war_reconciliation.ipynb

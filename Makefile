@@ -2,7 +2,7 @@ PYTHON := .venv/bin/python
 UV := uv
 TORCH_INDEX := https://download.pytorch.org/whl/cpu
 
-.PHONY: setup test test-all lint path-a path-b
+.PHONY: setup test test-all lint path-a path-b notebook all
 
 setup:
 	$(UV) venv --python 3.12 --allow-existing .venv
@@ -25,3 +25,12 @@ path-a:
 
 path-b:
 	$(PYTHON) scripts/run_path_b.py
+
+notebook:
+	$(PYTHON) -m nbconvert --execute --to notebook --inplace notebooks/01_holy_war_reconciliation.ipynb
+
+all:
+	$(MAKE) lint test
+	$(MAKE) path-a
+	$(MAKE) path-b
+	$(MAKE) notebook
